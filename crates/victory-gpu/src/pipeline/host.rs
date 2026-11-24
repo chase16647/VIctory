@@ -289,8 +289,9 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// A host pipeline for vertex (optionally geometry) and pixel shaders,
+    /// or mesh and pixel shaders, with the graphics state `g`, or for one
+    /// compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
@@ -300,14 +301,22 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        // A geometry stage follows a vertex shader (D3D12 has none after a
+        // mesh shader). The console's is the GS half of a merged ES/GS
+        // stage; its ES half is not used: the vertex shader container's own
+        // VS program runs instead (see victory-shader's legacy geometry).
+        let geometry = find("geometry");
+        if geometry.is_some() && (mesh.is_some() || find("vertex").is_none()) {
+            return refuse("a geometry shader without a vertex shader", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -317,6 +326,7 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
@@ -486,11 +496,21 @@ impl HostPipeline {
             });
         }
 
+        // The stages by kind: vertex first, then the geometry and pixel
+        // shaders when there are.
+        let of = |kind| {
+            stages
+                .iter()
+                .position(|(s, _)| s.stage == kind)
+                .map_or_else(D3D12_SHADER_BYTECODE::default, &code)
+        };
+        let (vs, gs, ps) = (of("vertex"), of("geometry"), of("pixel"));
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
+            VS: vs,
+            GS: gs,
+            PS: ps,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -515,7 +535,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&vs), &code_bytes(&ps), &code_bytes(&gs)],
             &state,
         );
         let made = super::library::pipeline(
