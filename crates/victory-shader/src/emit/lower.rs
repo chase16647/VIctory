@@ -1097,9 +1097,9 @@ impl<'a> Lower<'a> {
             .max()
             .ok_or("a geometry shader without outputs")?;
         let words = self.s.m.array(emits * 4 * nreg, self.s.t.i32);
-        let stage = self.s.m.global("gs_stage", words, 0);
+        let stage = self.s.m.static_global("gs_stage", words);
         let one = self.s.m.array(1, self.s.t.i32);
-        let emitted = self.s.m.global("gs_emitted", one, 0);
+        let emitted = self.s.m.static_global("gs_emitted", one);
         let zero = self.s.m.i32(0);
         let at = self.s.m.element(self.cur, emitted, zero);
         self.s.m.store(self.cur, at, zero);

@@ -444,11 +444,6 @@ impl Shader {
             };
             let (ni, no) = (scalars(&self.inputs), scalars(&self.outputs));
             let mut view = vec![ni, no];
-            // A geometry shader counts outputs per stream (four); only stream
-            // 0 has any, so only its dependence masks follow.
-            if self.gs.is_some() {
-                view.extend([0, 0, 0]);
-            }
             // Mesh shaders have no inputs: then the primitive outputs' count.
             if self.mesh.is_some() {
                 view.push(scalars(&self.prims));
@@ -462,6 +457,13 @@ impl Shader {
                         (1 << bits) - 1
                     });
                 }
+            }
+            // A geometry shader has four streams, each serialised as its
+            // output count then its masks (DXC's `DxilViewIdState::Serialize`
+            // interleaves them); only stream 0 has outputs, so streams 1-3
+            // are a zero count with no masks.
+            if self.gs.is_some() {
+                view.extend([0, 0, 0]);
             }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
