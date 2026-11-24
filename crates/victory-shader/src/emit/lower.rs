@@ -7034,6 +7034,24 @@ mod tests {
         );
     }
 
+    /// The geometry shader above through the DXIL validator in `dxil.dll`
+    /// (the newest Windows SDK's, or `VICTORY_DXIL`); skipped without one.
+    #[test]
+    #[cfg(windows)]
+    fn a_geometry_shader_validates() {
+        let mut words = GS_BODY.to_vec();
+        words.extend([GS_EMIT_CUT, GS_DONE, S_ENDPGM]);
+        let mut c = lower_gs(&words).expect("a geometry shader lowers").dxil;
+        let path = crate::emit::validator::Validator::default_path();
+        let Ok(mut v) = crate::emit::validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let ours = c[4..20].to_vec();
+        v.validate(&mut c).expect("the geometry shader validates");
+        assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
     #[test]
     fn a_geometry_shader_must_emit_on_stream_0() {
         // No emit message: no vertex to size the outputs by.
