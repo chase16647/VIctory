@@ -114,6 +114,49 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// A geometry shader's fixed state, as `PSV0` records it (runtime info
+/// version 1 and later): `GSInfo` at the start of the stage union, the
+/// maximum vertex count after the signature element counts' prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GsInfo {
+    /// `D3D_PRIMITIVE`: 1 point, 2 line, 3 triangle, 6 line, 7 triangle
+    /// with adjacency.
+    pub input_primitive: u32,
+    /// `D3D_PRIMITIVE_TOPOLOGY` of the output streams: 1 point list, 3 line
+    /// strip, 5 triangle strip.
+    pub output_topology: u32,
+    /// Bit n: stream n is written.
+    pub stream_mask: u32,
+    pub max_vertices: u16,
+}
+
+/// The PSV shader kind of a geometry shader.
+pub(crate) const PSV_GEOMETRY: u8 = 2;
+
+/// Reads a geometry shader's state from a `PSV0` part. `None` when the part
+/// is too old to carry the vertex count (runtime info version 0) or does
+/// not describe a geometry shader.
+pub(crate) fn gs_info(psv0: &[u8]) -> Option<GsInfo> {
+    use crate::dxbc::u32_at;
+    // Runtime info version 1 is 36 bytes; its stage byte is at 24.
+    let size = u32_at(psv0, 0).ok()? as usize;
+    if size < 36 {
+        return None;
+    }
+    let info = psv0.get(4..4 + size)?;
+    if info[24] != PSV_GEOMETRY {
+        return None;
+    }
+    let gs = GsInfo {
+        input_primitive: u32_at(info, 0).ok()?,
+        output_topology: u32_at(info, 4).ok()?,
+        stream_mask: u32_at(info, 8).ok()?,
+        max_vertices: u16::from_le_bytes([info[26], info[27]]),
+    };
+    // A geometry shader emits at least one vertex on some stream.
+    (gs.max_vertices != 0 && gs.stream_mask != 0).then_some(gs)
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
@@ -136,6 +179,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: its state (`flag` is then whether it writes a position).
+    pub gs: Option<GsInfo>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -179,6 +224,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(gs) = p.gs {
+        // GSInfo fills the stage union in place of the vertex shader's flag.
+        info[0..4].copy_from_slice(&gs.input_primitive.to_le_bytes());
+        info[4..8].copy_from_slice(&gs.output_topology.to_le_bytes());
+        info[8..12].copy_from_slice(&gs.stream_mask.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&gs.max_vertices.to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -360,6 +413,74 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gs_psv(gs: GsInfo) -> Vec<u8> {
+        psv(&Psv {
+            stage: PSV_GEOMETRY,
+            flag: true,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            gs: Some(gs),
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: Some(64),
+        })
+    }
+
+    const TRIANGLE_STRIP_GS: GsInfo = GsInfo {
+        input_primitive: 3,
+        output_topology: 5,
+        stream_mask: 1,
+        max_vertices: 18,
+    };
+
+    #[test]
+    fn geometry_state_round_trips_through_psv0() {
+        let part = gs_psv(TRIANGLE_STRIP_GS);
+        assert_eq!(gs_info(&part), Some(TRIANGLE_STRIP_GS));
+        // The fields sit where PSVRuntimeInfo puts them: GSInfo at the start
+        // of the stage union (position flag at 12), the stage at 24 and the
+        // maximum vertex count at 26, after the 4-byte size.
+        let info = &part[4..];
+        assert_eq!(info[0..4], 3u32.to_le_bytes());
+        assert_eq!(info[4..8], 5u32.to_le_bytes());
+        assert_eq!(info[8..12], 1u32.to_le_bytes());
+        assert_eq!(info[12], 1);
+        assert_eq!(info[24], PSV_GEOMETRY);
+        assert_eq!(info[26..28], 18u16.to_le_bytes());
+    }
+
+    #[test]
+    fn geometry_state_needs_a_geometry_psv0_of_version_1() {
+        let part = gs_psv(TRIANGLE_STRIP_GS);
+        // Another stage.
+        let mut vertex = part.clone();
+        vertex[4 + 24] = 1;
+        assert_eq!(gs_info(&vertex), None);
+        // Runtime info version 0 (24 bytes) has no stage or vertex count.
+        let mut v0 = 24u32.to_le_bytes().to_vec();
+        v0.extend(&part[4..28]);
+        assert_eq!(gs_info(&v0), None);
+        // A size past the part's end.
+        let mut short = part.clone();
+        short.truncate(30);
+        assert_eq!(gs_info(&short), None);
+        // No vertices, or no stream written, is not a geometry shader's state.
+        for broken in [
+            GsInfo {
+                max_vertices: 0,
+                ..TRIANGLE_STRIP_GS
+            },
+            GsInfo {
+                stream_mask: 0,
+                ..TRIANGLE_STRIP_GS
+            },
+        ] {
+            assert_eq!(gs_info(&gs_psv(broken)), None);
+        }
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
