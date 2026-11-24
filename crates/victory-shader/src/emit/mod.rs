@@ -195,12 +195,12 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
@@ -266,6 +266,19 @@ pub fn emit(
         }
         _ => 0,
     };
+    // A geometry program (the GS half of a merged stage; its copy shader is
+    // the container's VS record, not translated): its state is in PSV0.
+    let gs = match native.stage {
+        HwStage::Gs => Some(
+            c.part(FourCC::PSV0)
+                .and_then(|p| container::gs_info(p.data))
+                .ok_or(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a geometry shader without its state in PSV0",
+                })?,
+        ),
+        _ => None,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -276,6 +289,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        gs,
     })?;
     Ok(HostShader {
         stage: native.stage,

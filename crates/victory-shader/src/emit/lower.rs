@@ -50,6 +50,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: its state, from the console container's `PSV0`.
+    pub gs: Option<super::container::GsInfo>,
 }
 
 enum Stop {
@@ -79,6 +81,34 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// `s_sendmsg` ids of a legacy geometry shader: `MSG_GS` (its operation in
+/// bits 4-5: 1 cut, 2 emit, 3 emit and cut; the stream in bits 8-9) and
+/// `MSG_GS_DONE`.
+const MSG_GS: u16 = 2;
+const MSG_GS_DONE: u16 = 3;
+
+/// A legacy geometry shader's output vertices. The console writes each
+/// vertex it will emit to the lane's GSVS area in LDS, slot k at dwords
+/// `4 * nreg * k ..`, dword `4 * register + component` of the output
+/// signature; `MSG_GS` emit then hands slot <emitted so far> to the copy
+/// shader. Here the slots are thread-private memory and the emit stores
+/// that slot to the outputs and emits the vertex.
+#[derive(Debug, Clone, Copy)]
+struct Gs {
+    /// `[slots * 4 * nreg x i32]`, address space 0 (per invocation).
+    stage: V,
+    /// `[1 x i32]`: vertices emitted so far.
+    emitted: V,
+    /// Output registers per vertex: the highest output row plus one.
+    nreg: u32,
+    /// Slots: the program's emit messages (its most vertices).
+    slots: u32,
+}
+
+/// Whether an `s_sendmsg` immediate emits a geometry shader vertex.
+fn gs_emits(imm: u16) -> bool {
+    imm & 0xF == MSG_GS && imm >> 4 & 2 != 0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -161,6 +191,8 @@ struct Lower<'a> {
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
+    /// A legacy geometry shader's output staging (`Gs`).
+    gs: Option<Gs>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -348,6 +380,7 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        s.gs = x.gs;
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -461,6 +494,7 @@ impl<'a> Lower<'a> {
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
+            gs: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -843,6 +877,9 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if self.x.native.stage == HwStage::Gs {
+            self.gs = Some(self.gs_prologue().map_err(|w| unsupported(0, w))?);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1031,6 +1068,248 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// A legacy geometry shader's staging, made at entry: the slot count is
+    /// the number of emit messages, as each emits at most once per lane.
+    fn gs_prologue(&mut self) -> Result<Gs, Why> {
+        let emits = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "s_sendmsg")
+            .filter(|i| matches!(i.fields, Fields::Sopp { imm } if gs_emits(imm)))
+            .count() as u32;
+        if emits == 0 {
+            return Err("a geometry shader that emits no vertex");
+        }
+        if emits > 1024 {
+            return Err("a geometry shader with more vertices than D3D12 allows");
+        }
+        let nreg = self
+            .s
+            .outputs
+            .iter()
+            .filter_map(|e| e.row)
+            .map(|r| r + 1)
+            .max()
+            .ok_or("a geometry shader without outputs")?;
+        let words = self.s.m.array(emits * 4 * nreg, self.s.t.i32);
+        let stage = self.s.m.global("gs_stage", words, 0);
+        let one = self.s.m.array(1, self.s.t.i32);
+        let emitted = self.s.m.global("gs_emitted", one, 0);
+        let zero = self.s.m.i32(0);
+        let at = self.s.m.element(self.cur, emitted, zero);
+        self.s.m.store(self.cur, at, zero);
+        Ok(Gs {
+            stage,
+            emitted,
+            nreg,
+            slots: emits,
+        })
+    }
+
+    /// LDS in a legacy geometry shader: reads are input vertices, writes
+    /// output slots (see [`Gs`]). The vertex is the address's multiple of
+    /// the synthetic vertex stride (`io::GS_VERTEX_DWORDS`); the register and
+    /// component come from the instruction's own offset, as the console's
+    /// code addresses a vertex's fields.
+    fn gs_ds(&mut self, inst: &Inst, gs: Gs, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Ds {
+            dst,
+            addr,
+            data,
+            offset0,
+            offset1,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let (off0, off1) = (u32::from(*offset0), u32::from(*offset1));
+        let width = match name.rsplit('_').next() {
+            Some("b64") => 2,
+            Some("b96") => 3,
+            Some("b128") => 4,
+            Some("b32") => 1,
+            _ => return Err("a geometry shader LDS access of bytes or halves"),
+        };
+        // (byte offset, dwords) per element.
+        let elements = if name.starts_with("ds_read2_") || name.starts_with("ds_write2_") {
+            if name.contains("st64") {
+                return Err("a geometry shader LDS access with a 64-dword stride");
+            }
+            vec![(off0 * 4 * width, width), (off1 * 4 * width, width)]
+        } else {
+            vec![(off0 | off1 << 8, width)]
+        };
+        if elements.iter().any(|e| e.0 % 4 != 0) {
+            return Err("an unaligned geometry shader LDS access");
+        }
+        let stride = crate::io::GS_VERTEX_DWORDS;
+        if name.starts_with("ds_read") {
+            let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+            let c = self.cur;
+            let shift = self.s.m.i32((4 * stride).trailing_zeros());
+            let vertex = self.s.m.bin(c, Bin::LShr, a, shift);
+            let reg = match dst {
+                Some(Operand::Vector { reg, .. }) => *reg,
+                _ => return Err("an LDS read result"),
+            };
+            let mut n = 0;
+            for (off, w) in elements {
+                for k in 0..w {
+                    let dword = (off / 4 + k) % stride;
+                    let (row, comp) = ((dword / 4) as u8, (dword % 4) as u8);
+                    // A field the input signature lacks was never written by
+                    // the ES half; it reads as zero.
+                    let x = match self.find_input(row, comp) {
+                        Some((id, col)) => self.gs_load_input(id, col, vertex),
+                        None => self.s.m.i32(0),
+                    };
+                    self.write(inst, Reg::V(reg + n), x, guard);
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
+        if !name.starts_with("ds_write") {
+            return Err("a geometry shader LDS operation other than a read or write");
+        }
+        let mut stores = Vec::new();
+        for (e, (off, w)) in elements.into_iter().enumerate() {
+            let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+            for (k, x) in vals.into_iter().enumerate() {
+                let dword = off / 4 + k as u32;
+                if dword / (4 * gs.nreg) >= gs.slots {
+                    return Err("a geometry output past the vertices the program emits");
+                }
+                stores.push((dword, x));
+            }
+        }
+        let at = self.begin_guarded(guard);
+        for (dword, x) in stores {
+            let c = self.cur;
+            let index = self.s.m.i32(dword);
+            let p = self.s.m.element(c, gs.stage, index);
+            self.s.m.store(c, p, x);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// An input element's channel at a geometry shader's input `vertex`.
+    fn gs_load_input(&mut self, id: usize, col: u8, vertex: V) -> V {
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let float = e.comp == 9;
+        let (ty, suffix) = if float {
+            (self.s.t.f32, ".f32")
+        } else {
+            (self.s.t.i32, ".i32")
+        };
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            vertex,
+        ];
+        let c = self.cur;
+        let v = self.s.op(
+            c,
+            &format!("loadInput{suffix}"),
+            Attr::ReadNone,
+            ty,
+            4,
+            &args,
+        );
+        if float {
+            self.s.m.cast(c, Cast::Bitcast, v, self.s.t.i32)
+        } else {
+            v
+        }
+    }
+
+    /// `s_sendmsg` in a legacy geometry shader: emit the next staged vertex
+    /// and/or end the strip, on stream 0, for an active lane.
+    fn gs_message(&mut self, imm: u16, b: usize, i: usize) -> Result<(), Why> {
+        let gs = self.gs.ok_or("a geometry shader message")?;
+        let (id, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
+        if id == MSG_GS_DONE {
+            return Ok(());
+        }
+        if id != MSG_GS || op == 0 {
+            return Err("a message other than a geometry shader's emit or cut");
+        }
+        if stream != 0 {
+            return Err("a geometry shader stream other than 0");
+        }
+        let (emit, cut) = (op & 2 != 0, op & 1 != 0);
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        let void = self.s.t.void;
+        if emit {
+            let c = self.cur;
+            let zero = self.s.m.i32(0);
+            let count_at = self.s.m.element(c, gs.emitted, zero);
+            let k = self.s.m.load(c, count_at);
+            let per = self.s.m.i32(4 * gs.nreg);
+            let base = self.s.m.bin(c, Bin::Mul, k, per);
+            let outputs: Vec<(usize, u32, u8, u8, u8)> = self
+                .s
+                .outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(id, e)| Some((id, e.row?, e.col, e.cols, e.comp)))
+                .collect();
+            for (id, row, col0, cols, comp) in outputs {
+                for col in 0..cols {
+                    let c = self.cur;
+                    let off = self.s.m.i32(4 * row + u32::from(col0 + col));
+                    let index = self.s.m.bin(c, Bin::Add, base, off);
+                    let p = self.s.m.element(c, gs.stage, index);
+                    let x = self.s.m.load(c, p);
+                    self.s.outputs[id].usage |= 1 << col;
+                    let (suffix, x) = if comp == 9 {
+                        (".f32", self.as_float(x))
+                    } else {
+                        (".i32", x)
+                    };
+                    let args = [
+                        self.s.m.i32(id as u32),
+                        self.s.m.i32(0),
+                        self.s.m.i8(col),
+                        x,
+                    ];
+                    self.s.op(
+                        c,
+                        &format!("storeOutput{suffix}"),
+                        Attr::NoUnwind,
+                        void,
+                        5,
+                        &args,
+                    );
+                }
+            }
+            let c = self.cur;
+            let stream0 = self.s.m.i8(0);
+            self.s
+                .op(c, "emitStream", Attr::NoUnwind, void, 97, &[stream0]);
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(c, Bin::Add, k, one);
+            self.s.m.store(c, count_at, next);
+        }
+        if cut {
+            let c = self.cur;
+            let stream0 = self.s.m.i8(0);
+            self.s
+                .op(c, "cutStream", Attr::NoUnwind, void, 98, &[stream0]);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -2081,6 +2360,9 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if let Some(gs) = self.gs {
+            return self.gs_ds(inst, gs, guard);
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -2226,6 +2508,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || name == "s_sendmsg" && self.gs.is_some()
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -2243,6 +2526,9 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { imm } if name == "s_sendmsg" && self.gs.is_some() => {
+                self.gs_message(*imm, b, i)
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -6662,8 +6948,107 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            gs: None,
         })
         .map(|_| ())
+    }
+
+    /// Lowers a legacy geometry program (the GS half of a merged stage) with
+    /// one float4 input and an SV_Position output, emitting triangle strips.
+    fn lower_gs(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
+        use crate::emit::container::{GsInfo, SigElement};
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::None,
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let element = |name: &str, kind| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![element("TEXCOORD", 0)],
+            outputs: vec![element("SV_Position", 3)],
+            prims: vec![],
+            mesh_stride: 0,
+            gs: Some(GsInfo {
+                input_primitive: 3,
+                output_topology: 5,
+                stream_mask: 1,
+                max_vertices: 1,
+            }),
+        })
+    }
+
+    const GS_EMIT_CUT: u32 = 0xBF90_0032; // s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT_CUT, 0)
+    const GS_DONE: u32 = 0xBF90_0003; // s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)
+
+    /// Vertex 1's input register 0, channel 1 to output slot 0, channel 0.
+    const GS_BODY: [u32; 7] = [
+        0x2C08_0090, // v_lshrrev_b32 v4, 16, v0 (vertex 1's dword offset)
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4 (in bytes)
+        0xD8D8_0004, // ds_read_b32 v5, v4 offset:4 (register 0, channel 1)
+        0x0500_0004,
+        0x7E0C_0280, // v_mov_b32 v6, 0 (the lane's GSVS area)
+        0xD834_0000, // ds_write_b32 v6, v5 (slot 0, register 0, channel 0)
+        0x0000_0506,
+    ];
+
+    #[test]
+    fn a_geometry_shader_reads_vertices_and_emits() {
+        let mut words = GS_BODY.to_vec();
+        words.extend([GS_EMIT_CUT, GS_DONE, S_ENDPGM]);
+        let l = lower_gs(&words).expect("a geometry shader lowers");
+        // A geometry program (kind 2, shader model 6.6) whose PSV0 carries
+        // the state the console container gave.
+        let c = crate::dxbc::Container::parse(&l.dxil).unwrap();
+        let dxil = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        assert_eq!(dxil[0..4], (2u32 << 16 | 0x66).to_le_bytes());
+        let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+        let gs = crate::emit::container::gs_info(psv).expect("geometry state");
+        assert_eq!(
+            (gs.input_primitive, gs.output_topology, gs.max_vertices),
+            (3, 5, 1)
+        );
+    }
+
+    #[test]
+    fn a_geometry_shader_must_emit_on_stream_0() {
+        // No emit message: no vertex to size the outputs by.
+        let mut silent = GS_BODY.to_vec();
+        silent.extend([GS_DONE, S_ENDPGM]);
+        assert!(lower_gs(&silent).is_err());
+        // An emit on stream 1.
+        let mut stream1 = GS_BODY.to_vec();
+        stream1.extend([0xBF90_0122, GS_DONE, S_ENDPGM]);
+        assert!(lower_gs(&stream1).is_err());
+        // A write past the emitted vertices' slots (slot 1 of 1).
+        let mut past = GS_BODY.to_vec();
+        past[5] = 0xD834_0010; // ds_write_b32 v6, v5 offset:16
+        past.extend([GS_EMIT_CUT, S_ENDPGM]);
+        assert!(lower_gs(&past).is_err());
     }
 
     #[test]
