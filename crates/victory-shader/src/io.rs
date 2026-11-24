@@ -70,7 +70,34 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Legacy geometry (the GS half of a merged ES/GS stage): the LDS dword
+    /// offsets of the input vertices, 16 bits each: `v0` holds vertices 0
+    /// and 1, `v1` vertex 2 in its low half.
+    GsVertexOffsets(u8),
+    /// Legacy geometry: s3, the merged stage's wave info (the GS thread
+    /// count in bits 8-15).
+    GsWaveInfo,
 }
+
+/// The LDS dword stride the translation gives each input vertex of a
+/// geometry shader: input vertex `i` starts at dword `GS_VERTEX_DWORDS * i`,
+/// so an LDS byte address is vertex `address / (4 * GS_VERTEX_DWORDS)` and,
+/// modulo the stride, dword `4 * register + component` of the input
+/// signature (the ES half wrote its outputs that way).
+pub const GS_VERTEX_DWORDS: u32 = 64;
+
+/// The synthetic value of `v0` (`k = 0`) or `v1` (`k = 1`) on entry to a
+/// geometry shader: the offsets of vertices 0 and 1, then 2.
+pub fn gs_vertex_offsets(k: u8) -> u32 {
+    match k {
+        0 => GS_VERTEX_DWORDS << 16,
+        _ => 2 * GS_VERTEX_DWORDS,
+    }
+}
+
+/// The synthetic `s3` of a geometry shader: one primitive per host
+/// invocation, but the console code sizes its EXEC from a full wave.
+pub const GS_WAVE_INFO: u32 = 64 << 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Barycentric {
@@ -254,6 +281,16 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        // Legacy geometry: the vertex offsets and the wave info; the outputs
+        // go through LDS and `s_sendmsg`, not `exp` (lowered per instruction).
+        (StageIo::None, HwStage::Gs) => {
+            let loaded = vec![
+                (Reg::V(0), Input::GsVertexOffsets(0)),
+                (Reg::V(1), Input::GsVertexOffsets(1)),
+                (Reg::S(3), Input::GsWaveInfo),
+            ];
+            (loaded, &[][..], &[][..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
@@ -615,6 +652,53 @@ mod tests {
             (Target::Color(0), true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
+    }
+
+    #[test]
+    fn geometry_inputs_are_the_vertex_offsets_and_the_wave_info() {
+        // The GS half of a merged stage reads its vertex offsets from v0/v1
+        // and sizes EXEC from s3; it has no stage data.
+        let code: Vec<u8> = [
+            0x7E04_0300, // v_mov_b32 v2, v0
+            0x7E06_0301, // v_mov_b32 v3, v1
+            0xBE84_0303, // s_mov_b32 s4, s3
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::None,
+            code: vec![],
+        };
+        let io = raise(&p, &native).unwrap();
+        let input = |reg| p.inputs.iter().find(|i| i.0 == reg).unwrap().1;
+        assert!(
+            io.inputs
+                .contains(&(input(Reg::V(0)), Input::GsVertexOffsets(0)))
+        );
+        assert!(
+            io.inputs
+                .contains(&(input(Reg::V(1)), Input::GsVertexOffsets(1)))
+        );
+        assert!(io.inputs.contains(&(input(Reg::S(3)), Input::GsWaveInfo)));
+        assert!(io.exports.is_empty() && io.interps.is_empty());
+        // Vertex i's offset, scaled to bytes, divides back to i.
+        let offsets = [
+            gs_vertex_offsets(0) & 0xFFFF,
+            gs_vertex_offsets(0) >> 16,
+            gs_vertex_offsets(1) & 0xFFFF,
+        ];
+        for (i, dwords) in offsets.into_iter().enumerate() {
+            assert_eq!(4 * dwords / (4 * GS_VERTEX_DWORDS), i as u32);
+        }
+        assert_eq!(GS_WAVE_INFO >> 8 & 0xFF, 64);
     }
 
     #[test]

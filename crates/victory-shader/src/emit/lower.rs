@@ -973,6 +973,10 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            Input::GsVertexOffsets(k) => {
+                return Val::I32(self.s.m.i32(crate::io::gs_vertex_offsets(k)));
+            }
+            Input::GsWaveInfo => return Val::I32(self.s.m.i32(crate::io::GS_WAVE_INFO)),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
